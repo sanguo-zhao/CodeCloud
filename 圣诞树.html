@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>动态交互粒子视觉系统</title>
+    <style>
+        /* 全局样式 */
+        body { margin: 0; overflow: hidden; background-color: #000010; font-family: 'Segoe UI', sans-serif; }
+        #canvas-container { width: 100vw; height: 100vh; position: absolute; top: 0; left: 0; z-index: 1; }
+
+        /* UI 层 */
+        #ui-layer {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            pointer-events: none; z-index: 10;
+        }
+
+        /* 摄像头窗口 */
+        .cam-wrapper {
+            position: absolute; bottom: 20px; left: 20px;
+            width: 180px; height: 135px; /* 4:3 比例 */
+            background: rgba(0, 0, 0, 0.5);
+            border: 1px solid rgba(0, 255, 255, 0.3);
+            border-radius: 12px;
+            overflow: hidden;
+            pointer-events: auto;
+            backdrop-filter: blur(8px);
+            box-shadow: 0 0 25px rgba(0, 255, 255, 0.2);
+            resize: both; /* 允许调整大小 */
+            min-width: 100px; min-height: 75px;
+            max-width: 40%; max-height: 40%;
+        }
+        .cam-video {
+            width: 100%; height: 100%; object-fit: cover;
+            transform: scaleX(-1); opacity: 0.7;
+            display: block;
+        }
+        .status-indicator {
+            position: absolute; bottom: 6px; left: 0; width: 100%;
+            text-align: center; font-size: 11px; color: #0ff;
+            text-shadow: 0 0 6px #0ff;
+        }
+
+        /* 加载提示 */
+        #loader {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0, 0, 10, 0.95); z-index: 100;
+            display: flex; flex-direction: column;
+            align-items: center; justify-content: center;
+            transition: opacity 0.6s;
+        }
+        .spinner {
+            width: 50px; height: 50px; border: 5px solid #005;
+            border-top: 5px solid #0ff; border-radius: 50%;
+            animation: spin 1.2s linear infinite; margin-bottom: 25px;
+        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        #loader-text { color: #0ff; font-size: 20px; letter-spacing: 1px; }
+
+        /* 全屏按钮 */
+        #fullscreen-btn {
+            position: absolute; bottom: 20px; right: 20px;
+            background: rgba(0, 255, 255, 0.1); color: #0ff;
+            border: 1px solid rgba(0, 255, 255, 0.3);
+            padding: 10px 20px; border-radius: 30px;
+            cursor: pointer; z-index: 10;
+            font-size: 13px; font-weight: 500; letter-spacing: 0.5px;
+            transition: all 0.3s;
+        }
+        #fullscreen-btn:hover { background: rgba(0, 255, 255, 0.3); transform: translateY(-2px); }
+
+        /* Lil-gui 样式 */
+        .lil-gui { 
+            position: absolute; top: 20px; right: 20px; 
+            pointer-events: auto; 
+            --background-color: rgba(5, 10, 20, 0.8);
+            --text-color: #eee;
+            --widget-color: #008;
+            --hover-color: #00a;
+            backdrop-filter: blur(10px);
+        }
+    </style>
+
+    <!-- 依赖库 -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+                "lil-gui": "https://unpkg.com/lil-gui@0.19.1/dist/lil-gui.esm.min.js"
+            }
+        }
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+
+    <div id="loader">
+        <div class="spinner"></div>
+        <div id="loader-text">正在加载宇宙粒子...</div>
+    </div>
+
+    <div id="canvas-container"></div>
+    
+    <div id="ui-layer">
+        <div class="cam-wrapper">
+            <video class="input_video" playsinline muted></video>
+            <div id="status">等待 AI 模型加载...</div>
+        </div>
+        <button id="fullscreen-btn">全屏</button>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import GUI from 'lil-gui';
+
+        // ================= 配置 =================
+        const config = {
+            baseColor: '#00aaff', // 默认基础色
+            particleCount: 30000,
+            backgroundParticleCount: 10000,
+            particleSize: 0.25,
+            density: 1.0, // 对应扩散值
+            hueSpeed: 0.05, // 色相轮转速度
+            particleType: 'Nebula', // 默认模型
+            autoRotate: true
+        };
+
+        const modelTypes = ['Nebula', 'Fireworks', 'Saturn', 'Flower', 'Heart', 'SciFi Sphere'];
+        
+        let scene, camera, renderer, controls;
+        let particleSystem, backgroundParticles, colorController;
+        let originalPositions = []; // 存储基础模型顶点
+        let currentPositions = [];
+        let baseColor = new THREE.Color(config.baseColor);
+        let hueOffset = 0; // 色相偏移量
+
+        // ================= 初始化 Three.js =================
+        function initThree() {
+            const container = document.getElementById('canvas-container');
+
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x000010);
+            scene.fog = new THREE.FogExp2(0x000010, 0.015);
+
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.z = 35;
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            renderer.toneMapping = THREE.ACESFilmicToneMapping;
+            container.appendChild(renderer.domElement);
+
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.autoRotate = config.autoRotate;
+            controls.autoRotateSpeed = 1.5;
+
+            createParticles();
+            createBackgroundParticles();
+            initGUI();
+            initFullscreen();
+
+            window.addEventListener('resize', onWindowResize);
+
+            animate();
+            
+            // 3D 引擎启动后，异步初始化摄像头
+            setTimeout(initMediaPipe, 500);
+        }
+
+        // ================= 粒子系统 =================
+        function createParticles() {
+            if(particleSystem) scene.remove(particleSystem);
+
+            const geometry = new THREE.BufferGeometry();
+            const posArray = new Float32Array(config.particleCount * 3);
+            originalPositions = new Float32Array(config.particleCount * 3);
+            currentPositions = new Float32Array(config.particleCount * 3);
+
+            // 初始散开位置
+            for(let i=0; i<config.particleCount*3; i++) {
+                currentPositions[i] = (Math.random()-0.5) * 100;
+            }
+            geometry.setAttribute('position', new THREE.BufferAttribute(currentPositions, 3));
+
+            // 纹理和材质
+            const tex = getGlowTexture();
+            const material = new THREE.PointsMaterial({
+                size: config.particleSize,
+                map: tex,
+                vertexColors: true, // 使用顶点颜色
+                blending: THREE.AdditiveBlending,
+                depthWrite: false,
+                transparent: true,
+                opacity: 0.9
+            });
+
+            particleSystem = new THREE.Points(geometry, material);
+            scene.add(particleSystem);
+            updateModelShape(config.particleType);
+        }
+
+        function createBackgroundParticles() {
+            const geometry = new THREE.BufferGeometry();
+            const positions = [];
+            const colors = [];
+
+            for (let i = 0; i < config.backgroundParticleCount; i++) {
+                positions.push(
+                    (Math.random() - 0.5) * 150, // X
+                    (Math.random() - 0.5) * 150, // Y
+                    (Math.random() - 0.5) * 150  // Z
+                );
+                // 随机深空色调
+                const hue = Math.random();
+                const color = new THREE.Color().setHSL(hue, 0.6, 0.3); // 偏暗的蓝色/紫色
+                colors.push(color.r, color.g, color.b);
+            }
+            
+            geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+            geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+            
+            const material = new THREE.PointsMaterial({
+                size: 0.15,
+                map: getGlowTexture(),
+                vertexColors: true,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false,
+                transparent: true,
+                opacity: 0.7
+            });
+
+            backgroundParticles = new THREE.Points(geometry, material);
+            scene.add(backgroundParticles);
+        }
+
+        // 模型形状生成
+        function updateModelShape(type) {
+            const count = config.particleCount;
+            const density = config.density; // 影响扩散程度
+            
+            for (let i = 0; i < count; i++) {
+                const idx = i * 3;
+                let x, y, z;
+
+                // 基础形状生成
+                if (type === 'Heart') {
+                    const t = Math.random() * Math.PI * 2;
+                    x = 16 * Math.pow(Math.sin(t), 3);
+                    y = 13 * Math.cos(t) - 5 * Math.cos(2*t) - 2 * Math.cos(3*t) - Math.cos(4*t);
+                    z = (Math.random()-0.5) * 5;
+                    const scale = 0.5 * Math.cbrt(Math.random());
+                    x *= scale; y *= scale; z *= scale;
+                } else if (type === 'Flower') {
+                    const theta = Math.random() * Math.PI * 2;
+                    const phi = Math.acos(2 * Math.random() - 1);
+                    const r = 10 * (1 + 0.5 * Math.sin(5 * theta) * Math.sin(phi));
+                    x = r * Math.sin(phi) * Math.cos(theta);
+                    y = r * Math.sin(phi) * Math.sin(theta);
+                    z = r * Math.cos(phi);
+                } else if (type === 'Saturn') {
+                    if (Math.random() > 0.3) { // Ring
+                        const angle = Math.random() * Math.PI * 2;
+                        const dist = 8 + Math.random() * 6;
+                        x = Math.cos(angle) * dist; z = Math.sin(angle) * dist; y = (Math.random()-0.5) * 0.6;
+                    } else { // Body
+                        const theta = Math.random() * Math.PI * 2;
+                        const phi = Math.acos(2 * Math.random() - 1);
+                        const r = 5;
+                        x = r * Math.sin(phi) * Math.cos(theta); y = r * Math.sin(phi) * Math.sin(theta); z = r * Math.cos(phi);
+                    }
+                    const tx = x; x = x * 0.8 - y * 0.6; y = tx * 0.6 + y * 0.8; // Tilt
+                } else if (type === 'Fireworks') {
+                    const theta = Math.random() * Math.PI * 2;
+                    const phi = Math.acos(2 * Math.random() - 1);
+                    const r = Math.pow(Math.random(), 0.5) * 15;
+                    x = r * Math.sin(phi) * Math.cos(theta); y = r * Math.sin(phi) * Math.sin(theta); z = r * Math.cos(phi);
+                } else if (type === 'Nebula') {
+                    const radius = Math.pow(Math.random(), 0.5) * 20;
+                    const theta = Math.random() * Math.PI * 2;
+                    const phi = Math.acos(2 * Math.random() - 1);
+                    x = radius * Math.sin(phi) * Math.cos(theta);
+                    y = radius * Math.sin(phi) * Math.sin(theta);
+                    z = radius * Math.cos(phi);
+                } else { // SciFi Sphere (More structured)
+                    const segments = 10;
+                    const rings = 10;
+                    const phi = Math.PI * 2 * i / (segments * rings);
+                    const theta = Math.acos(2 * (i / (segments * rings)) - 1);
+                    const r = 12;
+                    x = r * Math.sin(theta) * Math.cos(phi);
+                    y = r * Math.sin(theta) * Math.sin(phi);
+                    z = r * Math.cos(theta);
+                }
+                
+                originalPositions[idx] = x * density;
+                originalPositions[idx+1] = y * density;
+                originalPositions[idx+2] = z * density;
+            }
+            
+            // Initial state: spread out slightly
+            applySpread(1.1); 
+        }
+
+        // 应用扩散/收缩
+        function applySpread(spreadFactor) {
+            const pos = currentPositions; // Use currentPositions for calculation
+            for (let i = 0; i < config.particleCount; i++) {
+                const idx = i * 3;
+                pos[idx] = originalPositions[idx] * spreadFactor;
+                pos[idx+1] = originalPositions[idx+1] * spreadFactor;
+                pos[idx+2] = originalPositions[idx+2] * spreadFactor;
+            }
+            particleSystem.geometry.attributes.position.array = pos;
+            particleSystem.geometry.attributes.position.needsUpdate = true;
+        }
+
+        // 纹理生成
+        function getGlowTexture() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 32; canvas.height = 32;
+            const ctx = canvas.getContext('2d');
+            const grad = ctx.createRadialGradient(16, 16, 0, 16, 16, 16);
+            grad.addColorStop(0, 'rgba(255,255,255,1)');
+            grad.addColorStop(0.4, 'rgba(255,255,255,0.3)');
+            grad.addColorStop(1, 'rgba(0,0,0,0)');
+            ctx.fillStyle = grad;
+            ctx.fillRect(0, 0, 32, 32);
+            const texture = new THREE.Texture(canvas);
+            texture.needsUpdate = true;
+            return texture;
+        }
+
+        // ================= 动画循环 =================
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const elapsedTime = Date.now() * 0.001;
+            hueOffset = (hueOffset + config.hueSpeed * 0.01) % 1.0; // 色相随时间流动
+
+            // --- 1. 应用手势交互 ---
+            // 扩散/收缩
+            const currentSpread = THREE.MathUtils.lerp(
+                particleSystem.geometry.attributes.position.array[0] / originalPositions[0] || 1.0, // Estimate current spread
+                config.density * interaction.spread, // Target spread based on hand pinch
+                0.1 // Smoothing factor
+            );
+            
+            // 应用到粒子
+            applySpread(currentSpread);
+
+            // 旋转 (手势左右移动)
+            let rotationY = 0;
+            if (interaction.active) {
+                 // 应用手势 X 坐标的旋转
+                rotationY = interaction.rotationOffset;
+            }
+            if (config.autoRotate) {
+                rotationY += elapsedTime * 0.2; // 自动旋转速度
+            }
+            particleSystem.rotation.y = rotationY;
+            backgroundParticles.rotation.y = rotationY * 0.5; // 背景也旋转，但慢一点
+
+            // --- 2. 更新粒子颜色 (动态色相 + 基础色) ---
+            const positions = particleSystem.geometry.attributes.position.array;
+            const colors = particleSystem.geometry.attributes.color.array;
+            const baseColorH = baseColor.getHSL(new THREE.Color()).h;
+
+            for (let i = 0; i < config.particleCount; i++) {
+                const idx = i * 3;
+                // 基于粒子自身位置的偏移量，使色相变化更丰富
+                const hueVariation = (positions[idx] + positions[idx+1] + positions[idx+2]) * 0.0001;
+                const finalHue = (baseColorH + hueOffset + hueVariation) % 1.0;
+                
+                const currentColor = new THREE.Color().setHSL(finalHue, 0.9, 0.6); // 饱和度/亮度稍高
+                colors[idx] = currentColor.r;
+                colors[idx+1] = currentColor.g;
+                colors[idx+2] = currentColor.b;
+            }
+            particleSystem.geometry.attributes.color.needsUpdate = true;
+
+            // --- 3. 背景粒子动画 ---
+            const bgPos = backgroundParticles.geometry.attributes.position.array;
+            const bgColors = backgroundParticles.geometry.attributes.color.array;
+            const bgScaleFactor = 1.0 + Math.sin(elapsedTime * 0.5) * 0.1; // 轻微缩放
+
+            for(let i = 0; i < config.backgroundParticleCount; i++) {
+                const idx = i * 3;
+                // 下落+随机偏移
+                bgPos[idx+1] -= 0.05 * bgScaleFactor; 
+                bgPos[idx] += Math.sin(elapsedTime * 1.0 + bgPos[idx]) * 0.01 * bgScaleFactor;
+                // 重置
+                if(bgPos[idx+1] < -75) {
+                    bgPos[idx+1] = 75;
+                    bgPos[idx] = (Math.random()-0.5) * 150;
+                    bgPos[idx+2] = (Math.random()-0.5) * 150;
+                }
+            }
+            backgroundParticles.geometry.attributes.position.needsUpdate = true;
+            // 背景粒子颜色也随全局色相变化
+            const bgHue = (baseColorH + hueOffset * 0.5) % 1.0; // 背景色相变化慢一点
+            const bgColor = new THREE.Color().setHSL(bgHue, 0.7, 0.4);
+            for(let i = 0; i < config.backgroundParticleCount; i++) {
+                 const idx = i * 3;
+                 bgColors[idx] = bgColor.r; bgColors[idx+1] = bgColor.g; bgColors[idx+2] = bgColor.b;
+            }
+            backgroundParticles.geometry.attributes.color.needsUpdate = true;
+
+
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        // ================= UI 与控制器 =================
+        function initGUI() {
+            const gui = new lil.GUI({ title: '粒子控制器' });
+
+            gui.add(config, 'particleType', modelTypes).name('模型类型').onChange(val => {
+                updateModelShape(val);
+            });
+
+            colorController = gui.addColor(config, 'baseColor').name('基础色调').onChange(val => {
+                baseColor.set(val);
+            });
+
+            gui.add(config, 'particleSize', 0.05, 0.5).name('粒子大小').onChange(val => {
+                particleSystem.material.size = val;
+            });
+            
+            gui.add(config, 'density', 0.5, 3.0).name('粒子密度').onChange(val => {
+                config.density = val; // 暂时不直接改变大小，而是通过applySpread控制
+            });
+
+            gui.add(config, 'hueSpeed', 0, 0.2).name('色相轮转速');
+            gui.add(config, 'autoRotate').name('自动旋转');
+            
+            if (window.innerWidth < 768) gui.close();
+        }
+
+        function initFullscreen() {
+            const btn = document.getElementById('fullscreen-btn');
+            btn.addEventListener('click', () => {
+                if (!document.fullscreenElement) document.documentElement.requestFullscreen();
+                else document.exitFullscreen();
+            });
+        }
+
+        // ================= MediaPipe Hand Tracking =================
+        function initMediaPipe() {
+            const videoEl = document.querySelector('.input_video');
+            const statusEl = document.getElementById('status');
+
+            const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+            hands.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+
+            hands.onResults(results => {
+                if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                    const lm = results.multiHandLandmarks[0];
+                    interaction.active = true;
+                    statusEl.innerText = "● 交互激活";
+                    
+                    // 1. 扩散/收缩 (拇指4 vs 食指8)
+                    const pinchDist = Math.hypot(lm[4].x - lm[8].x, lm[4].y - lm[8].y);
+                    // 映射距离到扩散因子 (0.02捏合->0.7, 0.2张开->2.5)
+                    const normPinch = Math.max(0, Math.min(1, (pinchDist - 0.02) / 0.18));
+                    interaction.spread = 0.7 + normPinch * 1.8;
+                    
+                    // 2. 旋转 (手掌中心X)
+                    const handX = lm[9].x; // 手掌中心
+                    interaction.rotationOffset = (handX - 0.5) * 5.0; // 左右摆动手掌以旋转模型
+
+                    // 3. 背景粒子缩放 (手掌Y - 模拟轻微的“呼吸”或“推拉”感)
+                    const handY = lm[9].y; // 手掌 Y 坐标 (0=top, 1=bottom)
+                    config.backgroundParticleCount = 10000 + Math.floor( (1-handY) * 10000 ); // 手越高，背景越多
+
+                } else {
+                    interaction.active = false;
+                    interaction.spread = 1.0; // 恢复默认
+                    interaction.rotationOffset = 0;
+                    statusEl.innerText = "等待手部检测...";
+                }
+            });
+
+            const camera = new Camera(videoEl, {
+                onFrame: async () => await hands.send({image: videoEl}),
+                width: 320, height: 240
+            });
+            
+            camera.start().then(() => {
+                statusEl.innerText = "摄像头已启动";
+            }).catch(err => {
+                console.error(err);
+                statusEl.innerText = "摄像头权限被拒绝";
+            });
+        }
+
+        // ================= 窗口事件 =================
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        // 启动
+        initThree();
+
+    </script>
+</body>
+</html>
